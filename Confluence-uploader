@@ -1,0 +1,209 @@
+from bs4 import BeautifulSoup
+import re
+import csv
+import os
+import json
+import requests
+from requests.auth import HTTPBasicAuth
+
+# Fetch environment variables
+region = str(os.getenv("regions"))
+version = str(os.getenv("version"))
+remove_keywords = str(os.getenv("Remove_Word"))
+change_from = str(os.getenv("Change_parameter1"))
+change_to = str(os.getenv("Change_parameter2"))
+space_name = "~" + str(os.getenv("space"))
+title_name = str(os.getenv("title"))
+csv_filepath = 'Country_name.csv'
+
+# Containers for country name, description, and unmatched entries
+country_data_list = []
+unmatched_countries = []
+
+# HTML content to be pushed to Confluence
+html_content = ""
+
+
+# Class to hold country-specific data
+class CountryData:
+    def __init__(self, name, version, iso_code, description):
+        self.name = name
+        self.version = version
+        self.iso_code = iso_code
+        self.description = description
+
+    def __str__(self):
+        return f"Country Name: {self.name}, ISO Code: {self.iso_code}, Description: {self.description}"
+
+
+# Convert region code to its full name
+def convert_region_code():
+    region_map = {
+        "cas": "Central Asia",
+        "eur": "Europe",
+        "nam": "North America",
+        "oce": "Oceania",
+        "sea": "Southeast Asia",
+        "mea": "Middle East Africa",
+        "isr": "Israel",
+        "lam": "Latin America",
+        "s_o": "Pacific Ocean",
+        "ind": "India",
+        "kor": "Korea"
+    }
+    return region_map.get(region, region)
+
+
+# Add country name and description to the HTML body
+def append_to_html_body(country_code, description):
+    global html_content
+    html_content += f"<h5>{country_code}</h5>{description}"
+
+
+# Match country name with ISO code from CSV file
+def match_country_iso_code(country_name):
+    with open(csv_filepath, 'r') as csv_file:
+        reader = csv.reader(csv_file)
+        next(reader)  # Skip header
+        for row in reader:
+            if row[1] == country_name or re.search(row[1], country_name):
+                return row[0]
+    return None
+
+
+# Clean and format description text
+def clean_description(text):
+    text = re.sub(r"[\n\t]*", "", text)
+    text = re.sub(' +', " ", text)
+    text = re.sub('\xa0', "", text)
+    text = re.sub('&nbsp;', "", text)
+    text = re.sub('&amp;', "and", text)
+    text = re.sub('&', "and", text)
+
+    if remove_keywords:
+        for keyword in remove_keywords.split(","):
+            text = re.sub(keyword, "", text)
+
+    if change_from and change_to:
+        change_from_list = change_from.split(",")
+        change_to_list = change_to.split(",")
+        for old, new in zip(change_from_list, change_to_list):
+            text = re.sub(old, new, text)
+
+    return text.strip()
+
+
+# Parse and extract country names and descriptions from the HTML file
+def parse_html_data():
+    file_path = f'/share/nds-sources/products/commercial/{region}{version}/documentation/mn/release_notes/release_notes/whats_new/'
+    pattern = f'highlights_and_improvements_mn_{region}_{version}.html'
+
+    with open(os.path.join(file_path, pattern), 'r') as html_file:
+        content = html_file.read()
+        soup = BeautifulSoup(content, 'html.parser')
+
+        # Get data source version
+        data_version = soup.find('title').text.split()[2]
+
+        # Extract country names
+        country_names = [clean_description(c.text) for c in soup.find_all("h2", {"class": "CountryName"})]
+
+        # Extract country descriptions
+        descriptions = []
+        for description_tag in soup.find_all("ul", {"class": "CountryRemark"}):
+            country_description = [clean_description(li.text) for li in description_tag.find_all("li")]
+            descriptions.append(country_description)
+
+        # Remove "General" if it exists as a country name
+        if country_names and country_names[0] == "General":
+            country_names.pop(0)
+            descriptions.pop(0)
+
+        # Match country names with ISO codes
+        iso_codes = []
+        for country_name in country_names:
+            iso_code = match_country_iso_code(country_name)
+            iso_codes.append(iso_code)
+            if iso_code is None:
+                unmatched_countries.append(country_name)
+
+        # Validate lengths of the lists
+        if len(country_names) == len(iso_codes) == len(descriptions):
+            for i in range(len(country_names)):
+                country_data_list.append(CountryData(country_names[i], data_version, iso_codes[i], descriptions[i]))
+        else:
+            print("Error: Mismatched list lengths of country data")
+
+
+# Print the parsed country data for verification
+def print_country_data():
+    print("Parsed Country Data:")
+    for country in country_data_list:
+        print(f"Country: {country.name}, ISO Code: {country.iso_code}, Version: {country.version}")
+        print(f"Description: {country.description}\n")
+
+
+# Prepare HTML data for Confluence
+def prepare_html_data():
+    global html_content
+    for count, country in enumerate(country_data_list):
+        description_as_html = "\n".join([f"<li>{desc}</li>" for desc in country.description])
+        if count == 0:
+            region_name = convert_region_code()
+            country.name = f"<h3>{region_name}</h3><br></br><h5>{country.name}</h5>"
+        append_to_html_body(country.name, description_as_html)
+
+
+# Fetch existing page data from Confluence
+def get_existing_page_data(auth, url):
+    headers = {"Accept": "application/json"}
+    response = requests.get(f"{url}?body-format=storage", headers=headers, auth=auth)
+    response_json = json.loads(response.text)
+    return response_json["body"]["storage"]["value"], response_json["version"]["number"] + 1
+
+
+# Push updated data to Confluence
+def push_data_to_confluence():
+    global html_content
+    page_id = os.getenv("page_id")
+    url = f"https://tomtom.atlassian.net/wiki/api/v2/pages/{page_id}"
+    auth = HTTPBasicAuth(os.getenv("user_name"), os.getenv("access_token"))
+
+    existing_body, new_version = get_existing_page_data(auth, url)
+
+    payload = json.dumps({
+        "id": page_id,
+        "status": "current",
+        "title": space_name,
+        "body": {
+            "representation": "storage",
+            "value": existing_body + html_content
+        },
+        "version": {
+            "number": new_version,
+            "message": "Update with new country data"
+        }
+    })
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    
+    response = requests.put(url, headers=headers, data=payload, auth=auth)
+    print(json.dumps(json.loads(response.text), indent=4))
+
+
+# Main execution flow
+parse_html_data()
+print(f"Total Country Count: {len(country_data_list)}")
+print_country_data()
+
+if unmatched_countries:
+    print("ERROR: The following countries are unmatched in the CSV file:")
+    for country in unmatched_countries:
+        print(country)
+else:
+    print("Pushing data to Confluence...")
+    prepare_html_data()
+    push_data_to_confluence()
